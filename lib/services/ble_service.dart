@@ -50,4 +50,8 @@ class BleService {
       return null;
     }
   }
+  
+  String? extractDisplayName(ScanResult result) {
+    return extractUser(result);
+  }  
 }
