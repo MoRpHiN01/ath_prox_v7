@@ -60,11 +60,22 @@ class _HomeScreenState extends State<HomeScreen> {
     await prefs.setString('instanceId', _instanceId);
 
     // 3) start discovery & BLE scan
-    await _netDisc.start(
-      _user.displayName,
-      _onNetworkPeer,
-      _onNetworkInvite,
-    );
+// inside _initialize (or wherever you start discovery):
+
+await _netDisc.start(
+  _user.displayName,
+  _onNetworkPeer,
+  _onNetworkInvite,
+  (String responderId, bool accepted) {
+    final peer = _peers[responderId];
+    if (peer != null) {
+      setState(() {
+        peer.status = accepted ? 'connected' : 'declined';
+      });
+    }
+  },
+);
+
     _bleService.startScan().listen(
       _onBleResult,
       onError: (e) => Fluttertoast.showToast(msg: 'BLE scan error: $e'),

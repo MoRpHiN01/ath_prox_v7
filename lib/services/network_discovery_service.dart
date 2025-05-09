@@ -11,20 +11,20 @@ class NetworkDiscoveryService {
   late String _displayName;
   Timer? _broadcastTimer;
 
-  /// Starts listening for peers and broadcasts status every 10s.
+  /// onFound(peerId, name, ip), onInvite(from, instanceId, ip),
+  /// onResponse(instanceId, accepted)
   Future<void> start(
     String displayName,
     void Function(String peerId, String name, String? ip) onFound,
     void Function(String from, String instanceId, String? ip)? onInvite,
+    void Function(String instanceId, bool accepted)? onResponse,
   ) async {
     _displayName = displayName;
 
-    // load or generate our instance ID
     final prefs = await SharedPreferences.getInstance();
     _instanceId = prefs.getString('instanceId') ?? const Uuid().v4();
     await prefs.setString('instanceId', _instanceId);
 
-    // bind UDP socket
     _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, port);
     _socket!.broadcastEnabled = true;
     _socket!.listen((event) {
@@ -37,13 +37,13 @@ class NetworkDiscoveryService {
         final map = jsonDecode(msg) as Map<String, dynamic>;
         if (map['proto'] != 'ath-prox-v1') return;
         final type = map['type'] as String;
-        final fromIp = dg.address.address;
+        final srcIp = dg.address.address;
 
         if (type == 'status') {
           final id = map['instanceId'] as String?;
           final user = map['user'] as String?;
           if (id != null && user != null && id != _instanceId) {
-            onFound(id, user, fromIp);
+            onFound(id, user, srcIp);
           }
         } else if (type == 'invite' && onInvite != null) {
           final from = map['from'] as String?;
@@ -52,15 +52,22 @@ class NetworkDiscoveryService {
           if (from != null &&
               instanceId != null &&
               targetId == _instanceId) {
-            onInvite(from, instanceId, fromIp);
+            onInvite(from, instanceId, srcIp);
+          }
+        } else if (type == 'response' && onResponse != null) {
+          final targetId = map['targetId'] as String?;
+          final accepted = map['accepted'] as bool? ?? false;
+          // only fire if it's for us?
+          if (targetId == _instanceId) {
+            onResponse(map['instanceId'] as String, accepted);
           }
         }
       } catch (_) {
-        // ignore bad packets
+        // ignore
       }
     });
 
-    // initial broadcast + periodic every 10s
+    /// broadcast every 10s
     broadcastStatus();
     _broadcastTimer = Timer.periodic(
       const Duration(seconds: 10),
@@ -68,7 +75,6 @@ class NetworkDiscoveryService {
     );
   }
 
-  /// Broadcast our presence to the LAN
   void broadcastStatus() {
     if (_socket == null) return;
     final payload = jsonEncode({
@@ -77,11 +83,13 @@ class NetworkDiscoveryService {
       'user': _displayName,
       'instanceId': _instanceId,
     });
-    _socket!
-        .send(utf8.encode(payload), InternetAddress('255.255.255.255'), port);
+    _socket!.send(
+      utf8.encode(payload),
+      InternetAddress('255.255.255.255'),
+      port,
+    );
   }
 
-  /// Send an invite to a peer over UDP
   Future<bool> sendInvite(
     String from,
     String fromId,
@@ -100,7 +108,6 @@ class NetworkDiscoveryService {
     return true;
   }
 
-  /// Send an invite response (accept/decline)
   Future<bool> sendInviteResponse(
     String from,
     String fromId,
@@ -121,7 +128,6 @@ class NetworkDiscoveryService {
     return true;
   }
 
-  /// Stop everything and clean up
   void stop() {
     _broadcastTimer?.cancel();
     _socket?.close();
