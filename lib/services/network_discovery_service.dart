@@ -11,8 +11,7 @@ class NetworkDiscoveryService {
   late String _displayName;
   Timer? _broadcastTimer;
 
-  /// onFound(peerId, name, ip), onInvite(from, instanceId, ip),
-  /// onResponse(instanceId, accepted)
+  /// onFound(peerId, name, ip), onInvite(from, instanceId, ip), onResponse(instanceId, accepted)
   Future<void> start(
     String displayName,
     void Function(String peerId, String name, String? ip) onFound,
@@ -20,7 +19,6 @@ class NetworkDiscoveryService {
     void Function(String instanceId, bool accepted)? onResponse,
   ) async {
     _displayName = displayName;
-
     final prefs = await SharedPreferences.getInstance();
     _instanceId = prefs.getString('instanceId') ?? const Uuid().v4();
     await prefs.setString('instanceId', _instanceId);
@@ -31,7 +29,6 @@ class NetworkDiscoveryService {
       if (event != RawSocketEvent.read) return;
       final dg = _socket!.receive();
       if (dg == null) return;
-
       try {
         final msg = utf8.decode(dg.data);
         final map = jsonDecode(msg) as Map<String, dynamic>;
@@ -49,25 +46,23 @@ class NetworkDiscoveryService {
           final from = map['from'] as String?;
           final instanceId = map['instanceId'] as String?;
           final targetId = map['targetId'] as String?;
-          if (from != null &&
-              instanceId != null &&
-              targetId == _instanceId) {
+          if (from != null && instanceId != null && targetId == _instanceId) {
             onInvite(from, instanceId, srcIp);
           }
         } else if (type == 'response' && onResponse != null) {
+          final sourceId = map['instanceId'] as String?;
           final targetId = map['targetId'] as String?;
           final accepted = map['accepted'] as bool? ?? false;
-          // only fire if it's for us?
-          if (targetId == _instanceId) {
-            onResponse(map['instanceId'] as String, accepted);
+          if (targetId == _instanceId && sourceId != null) {
+            onResponse(sourceId, accepted);
           }
         }
       } catch (_) {
-        // ignore
+        // ignore malformed packets
       }
     });
 
-    /// broadcast every 10s
+    // broadcast immediately and every 10s
     broadcastStatus();
     _broadcastTimer = Timer.periodic(
       const Duration(seconds: 10),

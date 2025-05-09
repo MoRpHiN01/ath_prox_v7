@@ -37,15 +37,15 @@ class _HomeScreenState extends State<HomeScreen> {
   bool _ready = false;
 
   final Map<String, PeerData> _peers = {};
+  Duration _totalSessionDuration = Duration.zero;
 
   @override
   void initState() {
     super.initState();
-    _initialize();
+    _init();
   }
 
-  Future<void> _initialize() async {
-    // 1) get permissions
+  Future<void> _init() async {
     await [
       Permission.location,
       Permission.bluetoothScan,
@@ -53,28 +53,17 @@ class _HomeScreenState extends State<HomeScreen> {
       Permission.bluetoothAdvertise
     ].request();
 
-    // 2) get user & instanceId
     _user = Provider.of<UserModel>(context, listen: false);
     final prefs = await SharedPreferences.getInstance();
     _instanceId = prefs.getString('instanceId') ?? const Uuid().v4();
     await prefs.setString('instanceId', _instanceId);
 
-    // 3) start discovery & BLE scan
-// inside _initialize (or wherever you start discovery):
-
-await _netDisc.start(
-  _user.displayName,
-  _onNetworkPeer,
-  _onNetworkInvite,
-  (String responderId, bool accepted) {
-    final peer = _peers[responderId];
-    if (peer != null) {
-      setState(() {
-        peer.status = accepted ? 'connected' : 'declined';
-      });
-    }
-  },
-);
+    await _netDisc.start(
+      _user.displayName,
+      _onNetworkPeer,
+      _onNetworkInvite,
+      _onNetworkResponse,
+    );
 
     _bleService.startScan().listen(
       _onBleResult,
@@ -89,10 +78,31 @@ await _netDisc.start(
     _updatePeer(id, name, ip: ip);
   }
 
-  void _onNetworkInvite(String from, String instanceId, String? ip) {
-    _updatePeer(instanceId, from, ip: ip);
-    final p = _peers[instanceId];
-    if (p != null) _showInvite(p);
+  void _onNetworkInvite(String from, String id, String? ip) {
+    if (id == _instanceId) return;
+    _updatePeer(id, from, ip: ip);
+    _showInvite(_peers[id]!);
+  }
+
+  void _onNetworkResponse(String responderId, bool accepted) {
+    final peer = _peers[responderId];
+    if (peer == null) return;
+    if (accepted) {
+      peer.status = 'connected';
+      peer.startTime = DateTime.now();
+      peer.elapsed = Duration.zero;
+      peer.timer?.cancel();
+      peer.timer = Timer.periodic(const Duration(seconds: 1), (_) {
+        setState(() {
+          if (peer.startTime != null) {
+            peer.elapsed = DateTime.now().difference(peer.startTime!);
+          }
+        });
+      });
+    } else {
+      peer.status = 'declined';
+    }
+    setState(() {});
   }
 
   void _onBleResult(ScanResult r) {
@@ -130,7 +140,25 @@ await _netDisc.start(
   }
 
   void _handleResponse(PeerData peer, bool accepted) {
-    setState(() => peer.status = accepted ? 'connected' : 'declined');
+    if (accepted) {
+      // Invited device accepted: start session
+      peer.status = 'connected';
+      peer.startTime = DateTime.now();
+      peer.elapsed = Duration.zero;
+      peer.timer?.cancel();
+      peer.timer = Timer.periodic(const Duration(seconds: 1), (_) {
+        setState(() {
+          if (peer.startTime != null) {
+            peer.elapsed = DateTime.now().difference(peer.startTime!);
+          }
+        });
+      });
+    } else {
+      peer.status = 'declined';
+    }
+    setState(() {});
+
+    // Send response back to inviter
     _netDisc.sendInviteResponse(
       _user.displayName,
       _instanceId,
@@ -138,37 +166,17 @@ await _netDisc.start(
       peer.ip,
       accepted,
     );
+
+    // Log session start or decline
     SessionSyncService.syncSessions([
       Session(
         sessionId: DateTime.now().millisecondsSinceEpoch.toString(),
         deviceId: peer.id,
         deviceName: peer.name,
-        startTime: DateTime.now(),
-        status:
-            accepted ? SessionStatus.accepted : SessionStatus.declined,
+        startTime: accepted ? peer.startTime! : DateTime.now(),
+        status: accepted ? SessionStatus.accepted : SessionStatus.declined,
       )
     ]);
-  }
-
-  Future<void> _advertise() async {
-    try {
-      final payload = {
-        'proto': 'ath-prox-v1',
-        'type': 'status',
-        'user': _user.displayName,
-        'instanceId': _instanceId,
-      };
-      await _blePeripheral.start(
-        advertiseData: AdvertiseData(
-          manufacturerId: 0xFF,
-          manufacturerData:
-              Uint8List.fromList(utf8.encode(jsonEncode(payload))),
-        ),
-      );
-      setState(() => _isAdvertising = true);
-    } catch (e) {
-      Fluttertoast.showToast(msg: 'Advertise error: $e');
-    }
   }
 
   Future<void> _sendInvite(PeerData peer) async {
@@ -178,51 +186,110 @@ await _netDisc.start(
       peer.id,
       peer.ip,
     );
-    setState(() => peer.status = ok ? 'pending' : 'declined');
+    peer.status = ok ? 'pending' : 'declined';
+    setState(() {});
+  }
+
+  void _endSession(PeerData peer) {
+    peer.timer?.cancel();
+    final endTime = DateTime.now();
+    final duration = peer.startTime != null
+        ? endTime.difference(peer.startTime!)
+        : Duration.zero;
+    _totalSessionDuration += duration;
+    SessionSyncService.syncSessions([
+      Session(
+        sessionId: peer.id + '_' + endTime.millisecondsSinceEpoch.toString(),
+        deviceId: peer.id,
+        deviceName: peer.name,
+        startTime: peer.startTime!,
+        endTime: endTime,
+        status: SessionStatus.completed,
+      )
+    ]);
+    peer.status = 'available';
+    peer.startTime = null;
+    peer.elapsed = Duration.zero;
+    setState(() {});
+  }
+
+  Future<void> _advertise() async {
+    final payload = {
+      'proto': 'ath-prox-v1',
+      'type': 'status',
+      'user': _user.displayName,
+      'instanceId': _instanceId,
+    };
+    try {
+      await _blePeripheral.start(
+        advertiseData: AdvertiseData(
+          manufacturerId: 0xFF,
+          manufacturerData: Uint8List.fromList(utf8.encode(jsonEncode(payload))),
+        ),
+      );
+      setState(() => _isAdvertising = true);
+    } catch (e) {
+      Fluttertoast.showToast(msg: 'Advertise error: $e');
+    }
+  }
+
+  String _formatDuration(Duration d) {
+    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$minutes:$seconds';
   }
 
   @override
-  Widget build(BuildContext ctx) {
+  Widget build(BuildContext context) {
     if (!_ready) {
       return const Scaffold(
         body: Center(child: CircularProgressIndicator()),
       );
     }
-
     final hasName = _user.displayName.trim().isNotEmpty;
     return Scaffold(
       appBar: AppBar(
-        title: Text(hasName
-            ? 'Welcome, ${_user.displayName}'
-            : 'Set Display Name'),
-        actions: [
-          IconButton(icon: const Icon(Icons.wifi), onPressed: _advertise)
-        ],
+        title: Text(hasName ? 'Welcome, ${_user.displayName}' : 'Set Display Name'),
+        actions: [IconButton(icon: const Icon(Icons.wifi), onPressed: _advertise)],
       ),
-      drawer: AppDrawer(
-        onNavigate: (route) =>
-            Navigator.of(context).pushReplacementNamed(route),
-      ),
+      drawer: AppDrawer(onNavigate: (r) => Navigator.of(context).pushReplacementNamed(r)),
       body: hasName
           ? Column(
               children: [
                 ElevatedButton(
                   onPressed: _advertise,
-                  child:
-                      Text(_isAdvertising ? 'Stop Advertising' : 'Start Advertising'),
+                  child: Text(_isAdvertising ? 'Stop Advertising' : 'Start Advertising'),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 8.0),
+                  child: Text('Total Session Time: ${_formatDuration(_totalSessionDuration)}'),
                 ),
                 Expanded(
                   child: _peers.isEmpty
                       ? const Center(child: Text('No peers found.'))
                       : ListView(
                           children: _peers.values.map((p) {
+                            final isConnected = p.status == 'connected';
                             return ListTile(
-                              leading: const CircleAvatar(radius: 8),
+                              leading: CircleAvatar(
+                                radius: 8,
+                                backgroundColor: p.status == 'available'
+                                    ? Colors.green
+                                    : p.status == 'pending'
+                                        ? Colors.yellow
+                                        : Colors.red,
+                              ),
                               title: Text(p.name),
-                              subtitle: Text('Status: ${p.status}'),
+                              subtitle: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text('Status: ${p.status}'),
+                                  if (isConnected) Text('Session Time: ${_formatDuration(p.elapsed)}'),
+                                ],
+                              ),
                               trailing: ElevatedButton(
-                                onPressed: () => _sendInvite(p),
-                                child: const Text('Invite'),
+                                onPressed: isConnected ? () => _endSession(p) : () => _sendInvite(p),
+                                child: Text(isConnected ? 'End Session' : 'Invite'),
                               ),
                             );
                           }).toList(),
@@ -232,8 +299,7 @@ await _netDisc.start(
             )
           : Center(
               child: ElevatedButton(
-                onPressed: () =>
-                    Navigator.of(context).pushNamed('/profile'),
+                onPressed: () => Navigator.of(context).pushNamed('/profile'),
                 child: const Text('Set Display Name'),
               ),
             ),
@@ -244,7 +310,16 @@ await _netDisc.start(
 class PeerData {
   final String id;
   String name;
-  String status = 'available';
+  String status;
   String? ip;
-  PeerData({required this.id, required this.name, this.ip});
+  DateTime? startTime;
+  Timer? timer;
+  Duration elapsed;
+
+  PeerData({
+    required this.id,
+    required this.name,
+    this.ip,
+  })  : status = 'available',
+        elapsed = Duration.zero;
 }
