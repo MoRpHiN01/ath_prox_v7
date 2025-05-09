@@ -1,3 +1,5 @@
+// lib/screens/home_screen.dart
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -63,6 +65,7 @@ class _HomeScreenState extends State<HomeScreen> {
       _onNetworkPeer,
       _onNetworkInvite,
       _onNetworkResponse,
+      _onNetworkEndSession,
     );
 
     _bleService.startScan().listen(
@@ -88,21 +91,19 @@ class _HomeScreenState extends State<HomeScreen> {
     final peer = _peers[responderId];
     if (peer == null) return;
     if (accepted) {
-      peer.status = 'connected';
-      peer.startTime = DateTime.now();
-      peer.elapsed = Duration.zero;
-      peer.timer?.cancel();
-      peer.timer = Timer.periodic(const Duration(seconds: 1), (_) {
-        setState(() {
-          if (peer.startTime != null) {
-            peer.elapsed = DateTime.now().difference(peer.startTime!);
-          }
-        });
-      });
+      _startPeerSession(peer);
     } else {
       peer.status = 'declined';
     }
     setState(() {});
+  }
+
+  void _onNetworkEndSession(String peerId) {
+    final peer = _peers[peerId];
+    if (peer != null) {
+      _endSessionLocal(peer);
+      setState(() {});
+    }
   }
 
   void _onBleResult(ScanResult r) {
@@ -141,24 +142,13 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _handleResponse(PeerData peer, bool accepted) {
     if (accepted) {
-      // Invited device accepted: start session
-      peer.status = 'connected';
-      peer.startTime = DateTime.now();
-      peer.elapsed = Duration.zero;
-      peer.timer?.cancel();
-      peer.timer = Timer.periodic(const Duration(seconds: 1), (_) {
-        setState(() {
-          if (peer.startTime != null) {
-            peer.elapsed = DateTime.now().difference(peer.startTime!);
-          }
-        });
-      });
+      _startPeerSession(peer);
     } else {
       peer.status = 'declined';
     }
     setState(() {});
 
-    // Send response back to inviter
+    // send response
     _netDisc.sendInviteResponse(
       _user.displayName,
       _instanceId,
@@ -167,7 +157,7 @@ class _HomeScreenState extends State<HomeScreen> {
       accepted,
     );
 
-    // Log session start or decline
+    // log start or decline
     SessionSyncService.syncSessions([
       Session(
         sessionId: DateTime.now().millisecondsSinceEpoch.toString(),
@@ -177,6 +167,18 @@ class _HomeScreenState extends State<HomeScreen> {
         status: accepted ? SessionStatus.accepted : SessionStatus.declined,
       )
     ]);
+  }
+
+  void _startPeerSession(PeerData peer) {
+    peer.status = 'connected';
+    peer.startTime = DateTime.now();
+    peer.elapsed = Duration.zero;
+    peer.timer?.cancel();
+    peer.timer = Timer.periodic(const Duration(seconds: 1), (_) {
+      setState(() {
+        peer.elapsed = DateTime.now().difference(peer.startTime!);
+      });
+    });
   }
 
   Future<void> _sendInvite(PeerData peer) async {
@@ -191,6 +193,19 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   void _endSession(PeerData peer) {
+    // local cleanup & log
+    _endSessionLocal(peer);
+
+    // notify other side
+    _netDisc.sendEndSession(
+      _user.displayName,
+      _instanceId,
+      peer.id,
+      peer.ip,
+    );
+  }
+
+  void _endSessionLocal(PeerData peer) {
     peer.timer?.cancel();
     final endTime = DateTime.now();
     final duration = peer.startTime != null
@@ -224,7 +239,8 @@ class _HomeScreenState extends State<HomeScreen> {
       await _blePeripheral.start(
         advertiseData: AdvertiseData(
           manufacturerId: 0xFF,
-          manufacturerData: Uint8List.fromList(utf8.encode(jsonEncode(payload))),
+          manufacturerData:
+              Uint8List.fromList(utf8.encode(jsonEncode(payload))),
         ),
       );
       setState(() => _isAdvertising = true);
@@ -234,9 +250,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   String _formatDuration(Duration d) {
-    final minutes = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final seconds = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    return '$minutes:$seconds';
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   @override
@@ -249,10 +265,12 @@ class _HomeScreenState extends State<HomeScreen> {
     final hasName = _user.displayName.trim().isNotEmpty;
     return Scaffold(
       appBar: AppBar(
-        title: Text(hasName ? 'Welcome, ${_user.displayName}' : 'Set Display Name'),
+        title:
+            Text(hasName ? 'Welcome, ${_user.displayName}' : 'Set Display Name'),
         actions: [IconButton(icon: const Icon(Icons.wifi), onPressed: _advertise)],
       ),
-      drawer: AppDrawer(onNavigate: (r) => Navigator.of(context).pushReplacementNamed(r)),
+      drawer:
+          AppDrawer(onNavigate: (r) => Navigator.of(context).pushReplacementNamed(r)),
       body: hasName
           ? Column(
               children: [
@@ -262,7 +280,8 @@ class _HomeScreenState extends State<HomeScreen> {
                 ),
                 Padding(
                   padding: const EdgeInsets.symmetric(vertical: 8.0),
-                  child: Text('Total Session Time: ${_formatDuration(_totalSessionDuration)}'),
+                  child:
+                      Text('Total Session Time: ${_formatDuration(_totalSessionDuration)}'),
                 ),
                 Expanded(
                   child: _peers.isEmpty
@@ -270,25 +289,32 @@ class _HomeScreenState extends State<HomeScreen> {
                       : ListView(
                           children: _peers.values.map((p) {
                             final isConnected = p.status == 'connected';
+                            Color color;
+                            switch (p.status) {
+                              case 'pending':
+                                color = Colors.yellow;
+                                break;
+                              case 'connected':
+                                color = Colors.red;
+                                break;
+                              default:
+                                color = Colors.green;
+                            }
                             return ListTile(
-                              leading: CircleAvatar(
-                                radius: 8,
-                                backgroundColor: p.status == 'available'
-                                    ? Colors.green
-                                    : p.status == 'pending'
-                                        ? Colors.yellow
-                                        : Colors.red,
-                              ),
+                              leading: CircleAvatar(radius: 8, backgroundColor: color),
                               title: Text(p.name),
                               subtitle: Column(
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   Text('Status: ${p.status}'),
-                                  if (isConnected) Text('Session Time: ${_formatDuration(p.elapsed)}'),
+                                  if (isConnected)
+                                    Text('Session Time: ${_formatDuration(p.elapsed)}'),
                                 ],
                               ),
                               trailing: ElevatedButton(
-                                onPressed: isConnected ? () => _endSession(p) : () => _sendInvite(p),
+                                onPressed: isConnected
+                                    ? () => _endSession(p)
+                                    : () => _sendInvite(p),
                                 child: Text(isConnected ? 'End Session' : 'Invite'),
                               ),
                             );

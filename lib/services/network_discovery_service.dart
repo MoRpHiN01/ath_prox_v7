@@ -1,3 +1,5 @@
+// lib/services/network_discovery_service.dart
+
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -11,12 +13,16 @@ class NetworkDiscoveryService {
   late String _displayName;
   Timer? _broadcastTimer;
 
-  /// onFound(peerId, name, ip), onInvite(from, instanceId, ip), onResponse(instanceId, accepted)
+  /// onFound(peerId, name, ip)
+  /// onInvite(from, instanceId, ip)
+  /// onResponse(instanceId, accepted)
+  /// onEndSession(instanceId)
   Future<void> start(
     String displayName,
     void Function(String peerId, String name, String? ip) onFound,
     void Function(String from, String instanceId, String? ip)? onInvite,
     void Function(String instanceId, bool accepted)? onResponse,
+    void Function(String instanceId)? onEndSession,
   ) async {
     _displayName = displayName;
     final prefs = await SharedPreferences.getInstance();
@@ -56,9 +62,15 @@ class NetworkDiscoveryService {
           if (targetId == _instanceId && sourceId != null) {
             onResponse(sourceId, accepted);
           }
+        } else if (type == 'end' && onEndSession != null) {
+          final sourceId = map['instanceId'] as String?;
+          final targetId = map['targetId'] as String?;
+          if (targetId == _instanceId && sourceId != null) {
+            onEndSession(sourceId);
+          }
         }
       } catch (_) {
-        // ignore malformed packets
+        // ignore bad JSON
       }
     });
 
@@ -78,11 +90,7 @@ class NetworkDiscoveryService {
       'user': _displayName,
       'instanceId': _instanceId,
     });
-    _socket!.send(
-      utf8.encode(payload),
-      InternetAddress('255.255.255.255'),
-      port,
-    );
+    _socket!.send(utf8.encode(payload), InternetAddress('255.255.255.255'), port);
   }
 
   Future<bool> sendInvite(
@@ -118,6 +126,24 @@ class NetworkDiscoveryService {
       'instanceId': fromId,
       'targetId': targetId,
       'accepted': accepted,
+    });
+    _socket!.send(utf8.encode(payload), InternetAddress(targetIp), port);
+    return true;
+  }
+
+  Future<bool> sendEndSession(
+    String from,
+    String fromId,
+    String targetId,
+    String? targetIp,
+  ) async {
+    if (_socket == null || targetIp == null) return false;
+    final payload = jsonEncode({
+      'proto': 'ath-prox-v1',
+      'type': 'end',
+      'from': from,
+      'instanceId': fromId,
+      'targetId': targetId,
     });
     _socket!.send(utf8.encode(payload), InternetAddress(targetIp), port);
     return true;
